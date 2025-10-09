@@ -33,11 +33,20 @@ if [ "$#" -eq 2 ]; then
     --process_id $epid --numa_node $numa_node
 fi
 
-# GDB mode
 if [ "$#" -eq 3 ]; then
-  blue "do.sh: Launching process $epid with GDB"
-  sudo -E env LD_LIBRARY_PATH=$LD_LIBRARY_PATH \
-    gdb -ex run --args \
+  blue "do.sh: Launching process $epid on NUMA node $numa_node"
+
+  env LD_LIBRARY_PATH=$LD_LIBRARY_PATH \
+    numactl --cpunodebind=$numa_node --membind=$numa_node \
     ./build/$autorun_app $(cat apps/$autorun_app/config) \
     --process_id $epid --numa_node $numa_node
 fi
+
+# GDB mode
+# if [ "$#" -eq 3 ]; then
+#   blue "do.sh: Launching process $epid with GDB"
+#   sudo -E env LD_LIBRARY_PATH=$LD_LIBRARY_PATH \
+#     gdb -ex run --args \
+#     ./build/$autorun_app $(cat apps/$autorun_app/config) \
+#     --process_id $epid --numa_node $numa_node
+# fi

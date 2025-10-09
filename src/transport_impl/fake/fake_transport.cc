@@ -116,6 +116,7 @@ void FakeTransport::fill_local_routing_info(routing_info_t *routing_info) const 
   fflush(stdout);
 }
 
+// Resolve the port information from the remote server you plan to send to
 bool FakeTransport::resolve_remote_routing_info(routing_info_t *routing_info) {
   // Socket routing info is already in the correct format
   // Just validate that we can parse it
