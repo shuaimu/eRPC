@@ -36,6 +36,13 @@ FakeTransport::FakeTransport(uint16_t sm_udp_port, uint8_t rpc_id,
                            std::string(strerror(errno)));
   }
 
+  // Set SO_REUSEPORT for scalable multi-threaded receive (kernel load balancing)
+  if (setsockopt(socket_fd_, SOL_SOCKET, SO_REUSEPORT, &reuse, sizeof(reuse)) < 0) {
+    close(socket_fd_);
+    throw std::runtime_error("FakeTransport: Failed to set SO_REUSEPORT: " +
+                           std::string(strerror(errno)));
+  }
+
   // Bind socket to local address
   memset(&local_addr_, 0, sizeof(local_addr_));
   local_addr_.sin_family = AF_INET;
@@ -67,7 +74,7 @@ FakeTransport::FakeTransport(uint16_t sm_udp_port, uint8_t rpc_id,
 
   // Add socket to epoll
   struct epoll_event ev;
-  ev.events = EPOLLIN | EPOLLET;  // Edge-triggered for efficiency
+  ev.events = EPOLLIN;  // Level-triggered for lower latency (no EPOLLET)
   ev.data.fd = socket_fd_;
   if (epoll_ctl(epoll_fd_, EPOLL_CTL_ADD, socket_fd_, &ev) < 0) {
     close(epoll_fd_);
