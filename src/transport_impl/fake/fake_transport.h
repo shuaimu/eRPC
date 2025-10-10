@@ -8,12 +8,13 @@
 #ifdef ERPC_FAKE
 
 #include "transport.h"
+#include "lockfree_queue.h"
+#include "packet_pool.h"
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
 #include <unistd.h>
-#include <queue>
-#include <mutex>
+#include <sys/epoll.h>
 #include <thread>
 #include <atomic>
 
@@ -60,20 +61,29 @@ class FakeTransport : public Transport {
 
   // Socket state
   int socket_fd_;
+  int epoll_fd_;  // Epoll for event-driven socket polling
   uint16_t local_port_;
   struct sockaddr_in local_addr_;
   uint32_t local_ipv4_addr_;  // Local IP address (resolved dynamically)
-  
+
   // Receive thread and buffers
   std::thread *rx_thread_;
   std::atomic<bool> stop_rx_thread_;
-  std::queue<std::pair<uint8_t*, size_t>> rx_packet_queue_;
-  std::mutex rx_queue_mutex_;
-  
-  // Receive ring buffer management  
+
+  // Lock-free packet queue (SPMC: single producer RX thread, multiple consumer workers)
+  static constexpr size_t kRxQueueCapacity = 16384;  // Must be power of 2
+  LockFreeSPMCQueue<PacketInfo, kRxQueueCapacity> rx_packet_queue_;
+
+  // Packet buffer pool (lock-free allocation)
+  PacketPool packet_pool_;
+
+  // Receive ring buffer management
   uint8_t **rx_ring_;  // Pointer to eRPC's rx_ring array
-  size_t rx_tail_;
-  
+  std::atomic<size_t> rx_tail_;  // Atomic to avoid races
+
+  // Batched receive support
+  static constexpr size_t kRecvBatchSize = 32;  // Receive up to 32 packets per syscall
+
   void rx_thread_func();
   void cleanup_rx_thread();
 };

@@ -11,20 +11,20 @@ namespace erpc {
 
 constexpr size_t FakeTransport::kMaxDataPerPkt;
 
-FakeTransport::FakeTransport(uint16_t sm_udp_port, uint8_t rpc_id, 
-                            uint8_t phy_port, size_t numa_node, 
+FakeTransport::FakeTransport(uint16_t sm_udp_port, uint8_t rpc_id,
+                            uint8_t phy_port, size_t numa_node,
                             FILE *trace_file)
     : Transport(TransportType::kFake, rpc_id, phy_port, numa_node, trace_file),
-      socket_fd_(-1), local_port_(sm_udp_port + 10000 + rpc_id), rx_thread_(nullptr), 
-      stop_rx_thread_(false), rx_ring_(nullptr), rx_tail_(0) {
-  
+      socket_fd_(-1), epoll_fd_(-1), local_port_(sm_udp_port + 10000 + rpc_id),
+      rx_thread_(nullptr), stop_rx_thread_(false), rx_ring_(nullptr), rx_tail_(0) {
+
   // Resolve local IP address for socket communication
   resolve_local_ip_address();
-  
+
   // Create UDP socket
   socket_fd_ = socket(AF_INET, SOCK_DGRAM, 0);
   if (socket_fd_ < 0) {
-    throw std::runtime_error("FakeTransport: Failed to create socket: " + 
+    throw std::runtime_error("FakeTransport: Failed to create socket: " +
                            std::string(strerror(errno)));
   }
 
@@ -32,7 +32,7 @@ FakeTransport::FakeTransport(uint16_t sm_udp_port, uint8_t rpc_id,
   int reuse = 1;
   if (setsockopt(socket_fd_, SOL_SOCKET, SO_REUSEADDR, &reuse, sizeof(reuse)) < 0) {
     close(socket_fd_);
-    throw std::runtime_error("FakeTransport: Failed to set SO_REUSEADDR: " + 
+    throw std::runtime_error("FakeTransport: Failed to set SO_REUSEADDR: " +
                            std::string(strerror(errno)));
   }
 
@@ -42,10 +42,10 @@ FakeTransport::FakeTransport(uint16_t sm_udp_port, uint8_t rpc_id,
   local_addr_.sin_addr.s_addr = INADDR_ANY;
   local_addr_.sin_port = htons(local_port_);
 
-  if (bind(socket_fd_, reinterpret_cast<struct sockaddr*>(&local_addr_), 
+  if (bind(socket_fd_, reinterpret_cast<struct sockaddr*>(&local_addr_),
            sizeof(local_addr_)) < 0) {
     close(socket_fd_);
-    throw std::runtime_error("FakeTransport: Failed to bind socket: " + 
+    throw std::runtime_error("FakeTransport: Failed to bind socket: " +
                            std::string(strerror(errno)));
   }
 
@@ -53,7 +53,26 @@ FakeTransport::FakeTransport(uint16_t sm_udp_port, uint8_t rpc_id,
   int flags = fcntl(socket_fd_, F_GETFL, 0);
   if (fcntl(socket_fd_, F_SETFL, flags | O_NONBLOCK) < 0) {
     close(socket_fd_);
-    throw std::runtime_error("FakeTransport: Failed to set non-blocking: " + 
+    throw std::runtime_error("FakeTransport: Failed to set non-blocking: " +
+                           std::string(strerror(errno)));
+  }
+
+  // Create epoll instance for event-driven polling
+  epoll_fd_ = epoll_create1(0);
+  if (epoll_fd_ < 0) {
+    close(socket_fd_);
+    throw std::runtime_error("FakeTransport: Failed to create epoll: " +
+                           std::string(strerror(errno)));
+  }
+
+  // Add socket to epoll
+  struct epoll_event ev;
+  ev.events = EPOLLIN | EPOLLET;  // Edge-triggered for efficiency
+  ev.data.fd = socket_fd_;
+  if (epoll_ctl(epoll_fd_, EPOLL_CTL_ADD, socket_fd_, &ev) < 0) {
+    close(epoll_fd_);
+    close(socket_fd_);
+    throw std::runtime_error("FakeTransport: Failed to add socket to epoll: " +
                            std::string(strerror(errno)));
   }
 
@@ -63,16 +82,21 @@ FakeTransport::FakeTransport(uint16_t sm_udp_port, uint8_t rpc_id,
 
 FakeTransport::~FakeTransport() {
   cleanup_rx_thread();
-  
+
+  if (epoll_fd_ >= 0) {
+    close(epoll_fd_);
+  }
+
   if (socket_fd_ >= 0) {
     close(socket_fd_);
   }
 
-  // Clean up any remaining packets in queue
-  std::lock_guard<std::mutex> lock(rx_queue_mutex_);
+  // Clean up any remaining packets in lock-free queue
   while (!rx_packet_queue_.empty()) {
-    free(rx_packet_queue_.front().first);
-    rx_packet_queue_.pop();
+    auto result = rx_packet_queue_.try_pop();
+    if (result.first) {
+      packet_pool_.free(result.second.get_data());
+    }
   }
 }
 
@@ -185,27 +209,27 @@ void FakeTransport::tx_flush() {
 }
 
 size_t FakeTransport::rx_burst() {
-  std::lock_guard<std::mutex> lock(rx_queue_mutex_);
-  
   size_t packets_processed = 0;
-  //printf("DEBUG: rx_burst called, queue_size=%zu\n", rx_packet_queue_.size());
-  //fflush(stdout);
-  
-  while (!rx_packet_queue_.empty() && packets_processed < kPostlist) {
-    auto pkt_info = rx_packet_queue_.front();
-    rx_packet_queue_.pop();
-    
-    uint8_t *pkt_data = pkt_info.first;
-    size_t pkt_size = pkt_info.second;
-    
+
+  // Lock-free dequeue - multiple workers can call this concurrently
+  while (packets_processed < kPostlist) {
+    auto result = rx_packet_queue_.try_pop();
+    if (!result.first) {
+      // Queue is empty
+      break;
+    }
+
+    PacketInfo pkt_info = result.second;
+
     // Store packet pointer directly in eRPC's RX ring
-    size_t ring_index = rx_tail_ % kNumRxRingEntries;
-    rx_ring_[ring_index] = pkt_data;
-    rx_tail_++;
-    
+    // Use atomic operations to avoid races between multiple consumers
+    size_t tail_val = rx_tail_.fetch_add(1, std::memory_order_relaxed);
+    size_t ring_index = tail_val & (kNumRxRingEntries - 1);
+    rx_ring_[ring_index] = pkt_info.get_data();
+
     packets_processed++;
   }
-  
+
   return packets_processed;
 }
 
@@ -214,36 +238,107 @@ void FakeTransport::post_recvs(size_t /* num_recvs */) {
 }
 
 void FakeTransport::rx_thread_func() {
-  uint8_t buffer[kMTU];
-  struct sockaddr_in sender_addr;
-  socklen_t sender_len = sizeof(sender_addr);
-  
+  // Prepare structures for recvmmsg (batch receive)
+  struct mmsghdr msgs[kRecvBatchSize];
+  struct iovec iovecs[kRecvBatchSize];
+  uint8_t *buffers[kRecvBatchSize];
+  struct sockaddr_in addrs[kRecvBatchSize];
+
+  // Pre-allocate buffers from pool
+  for (size_t i = 0; i < kRecvBatchSize; i++) {
+    buffers[i] = packet_pool_.alloc();
+    if (buffers[i] == nullptr) {
+      // Pool exhausted during initialization - fatal error
+      fprintf(stderr, "FakeTransport: Failed to allocate initial RX buffers\n");
+      return;
+    }
+
+    iovecs[i].iov_base = buffers[i];
+    iovecs[i].iov_len = packet_pool_.packet_size();
+
+    msgs[i].msg_hdr.msg_name = &addrs[i];
+    msgs[i].msg_hdr.msg_namelen = sizeof(addrs[i]);
+    msgs[i].msg_hdr.msg_iov = &iovecs[i];
+    msgs[i].msg_hdr.msg_iovlen = 1;
+    msgs[i].msg_hdr.msg_control = nullptr;
+    msgs[i].msg_hdr.msg_controllen = 0;
+    msgs[i].msg_hdr.msg_flags = 0;
+    msgs[i].msg_len = 0;
+  }
+
+  struct epoll_event events[kRecvBatchSize];
+  const int epoll_timeout_ms = 1;  // 1ms timeout (low latency mode)
+
   while (!stop_rx_thread_) {
-    ssize_t bytes_received = recvfrom(socket_fd_, buffer, sizeof(buffer),
-                                     MSG_DONTWAIT, 
-                                     reinterpret_cast<struct sockaddr*>(&sender_addr),
-                                     &sender_len);
-    
-    if (bytes_received > 0) {
-      // Allocate memory for packet copy
-      uint8_t *pkt_copy = static_cast<uint8_t*>(malloc(bytes_received));
-      if (pkt_copy != nullptr) {
-        memcpy(pkt_copy, buffer, bytes_received);
-        
-        // Add to receive queue
-        std::lock_guard<std::mutex> lock(rx_queue_mutex_);
-        rx_packet_queue_.push(std::make_pair(pkt_copy, bytes_received));
+    // Wait for socket to be readable (event-driven polling)
+    int nfds = epoll_wait(epoll_fd_, events, kRecvBatchSize, epoll_timeout_ms);
+
+    if (nfds < 0) {
+      if (errno == EINTR) continue;  // Interrupted by signal, retry
+      if (trace_file_ != nullptr) {
+        fprintf(trace_file_, "FakeTransport: epoll_wait error: %s\n", strerror(errno));
       }
-    } else if (bytes_received < 0) {
+      break;
+    }
+
+    if (nfds == 0) {
+      // Timeout - check stop flag and continue
+      continue;
+    }
+
+    // Socket is readable - receive batch of packets
+    int num_msgs = recvmmsg(socket_fd_, msgs, kRecvBatchSize, MSG_DONTWAIT, nullptr);
+
+    if (num_msgs < 0) {
       if (errno != EAGAIN && errno != EWOULDBLOCK) {
         if (trace_file_ != nullptr) {
-          fprintf(trace_file_, "FakeTransport: Receive error: %s\n", strerror(errno));
+          fprintf(trace_file_, "FakeTransport: recvmmsg error: %s\n", strerror(errno));
         }
       }
+      continue;
     }
-    
-    // Small delay to avoid busy waiting
-    std::this_thread::sleep_for(std::chrono::microseconds(10));
+
+    // Process received packets
+    for (int i = 0; i < num_msgs; i++) {
+      size_t pkt_size = msgs[i].msg_len;
+
+      // Try to enqueue packet (lock-free)
+      PacketInfo pkt_info(buffers[i], pkt_size);
+      bool enqueued = rx_packet_queue_.try_push(pkt_info);
+
+      if (!enqueued) {
+        // Queue is full - drop packet and free buffer
+        packet_pool_.free(buffers[i]);
+
+        if (trace_file_ != nullptr) {
+          fprintf(trace_file_, "FakeTransport: RX queue full, dropping packet\n");
+        }
+      }
+
+      // Allocate new buffer for next receive
+      buffers[i] = packet_pool_.alloc();
+      if (buffers[i] == nullptr) {
+        // Pool exhausted - allocate from heap as fallback
+        buffers[i] = static_cast<uint8_t*>(malloc(packet_pool_.packet_size()));
+        if (buffers[i] == nullptr) {
+          fprintf(stderr, "FakeTransport: Fatal - cannot allocate RX buffer\n");
+          stop_rx_thread_ = true;
+          return;
+        }
+      }
+
+      // Update iovec for next receive
+      iovecs[i].iov_base = buffers[i];
+      iovecs[i].iov_len = packet_pool_.packet_size();
+      msgs[i].msg_len = 0;  // Reset message length
+    }
+  }
+
+  // Cleanup: free any remaining buffers
+  for (size_t i = 0; i < kRecvBatchSize; i++) {
+    if (buffers[i] != nullptr) {
+      packet_pool_.free(buffers[i]);
+    }
   }
 }
 
@@ -254,12 +349,13 @@ void FakeTransport::cleanup_rx_thread() {
     delete rx_thread_;
     rx_thread_ = nullptr;
   }
-  
+
   if (rx_ring_ != nullptr) {
-    // Free any remaining packets in the ring
+    // Free any remaining packets in the ring back to pool
     for (size_t i = 0; i < kNumRxRingEntries; i++) {
       if (rx_ring_[i] != nullptr) {
-        free(rx_ring_[i]);
+        packet_pool_.free(rx_ring_[i]);
+        rx_ring_[i] = nullptr;
       }
     }
     rx_ring_ = nullptr;
