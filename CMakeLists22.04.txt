@@ -39,9 +39,6 @@ include_directories(${gtest_SOURCE_DIR}/include ${gtest_SOURCE_DIR})
 # Common sub-projects: gflags
 add_subdirectory(third_party/gflags)
 
-# Common sub-projects: asio
-include_directories(SYSTEM third_party/asio/include)
-
 # Add additional compilation flags only after adding subprojects
 #set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -std=gnu++11 -march=native -Wall -Wextra -Werror -pedantic")
 set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -std=gnu++11 -march=native -Wall -Wextra -pedantic")
