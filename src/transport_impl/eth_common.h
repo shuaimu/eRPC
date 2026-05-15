@@ -5,13 +5,7 @@
 
 #pragma once
 
-#ifdef _WIN32
-#define _WIN32_WINNT 0x0A00
-#endif
-
-#define ASIO_STANDLONE
-#include <asio/ts/internet.hpp>
-
+#include <arpa/inet.h>
 #include <assert.h>
 #include <stdint.h>
 #include <string.h>
